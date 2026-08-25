@@ -28,6 +28,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy import stats
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 st.set_page_config(page_title="Stream-lite · Baseline Table Builder", layout="wide")
 
@@ -326,6 +331,130 @@ def render_table_markdown(header, display_rows, group_col, alpha):
     return html
 
 
+def _set_cell_border(cell, **kwargs):
+    """Add borders to a single table cell. kwargs like
+    top={'sz':12,'val':'single','color':'000000'}."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcBorders = tcPr.find(qn('w:tcBorders'))
+    if tcBorders is None:
+        tcBorders = OxmlElement('w:tcBorders')
+        tcPr.append(tcBorders)
+    for edge in ('top', 'left', 'bottom', 'right'):
+        if edge in kwargs:
+            spec = kwargs[edge]
+            tag = f'w:{edge}'
+            el = tcBorders.find(qn(tag))
+            if el is None:
+                el = OxmlElement(tag)
+                tcBorders.append(el)
+            el.set(qn('w:val'), spec.get('val', 'single'))
+            el.set(qn('w:sz'), str(spec.get('sz', 8)))
+            el.set(qn('w:color'), spec.get('color', '000000'))
+
+
+def build_docx(header, display_rows, group_col, alpha, flags,
+                title="Table 1. Baseline characteristics"):
+    """Build a Word document with a three-line (journal-style) table."""
+    doc = Document()
+    h = doc.add_heading(title, level=2)
+    for r in h.runs:
+        r.font.size = Pt(13)
+
+    ncols = len(header)
+    table = doc.add_table(rows=1, cols=ncols)
+    table.autofit = True
+
+    hdr_cells = table.rows[0].cells
+    for i, htext in enumerate(header):
+        hdr_cells[i].text = str(htext)
+        for p in hdr_cells[i].paragraphs:
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(10)
+        _set_cell_border(hdr_cells[i], top={'sz': 12, 'val': 'single'},
+                          bottom={'sz': 8, 'val': 'single'})
+
+    n_rows = len(display_rows)
+    for idx, row in enumerate(display_rows):
+        cells = table.add_row().cells
+        is_last = idx == n_rows - 1
+        next_is_new_block = is_last or (display_rows[idx + 1]["kind"] in ("var", "varheader"))
+
+        if row["kind"] == "varheader":
+            cells[0].text = row["label"]
+            for run in cells[0].paragraphs[0].runs:
+                run.bold = True
+            for c in cells[1:]:
+                c.text = ""
+        else:
+            label = ("    " + row["label"]) if row["kind"] == "level" else row["label"]
+            cells[0].text = label
+            for run in cells[0].paragraphs[0].runs:
+                run.bold = (row["kind"] == "var")
+            ci = 1
+            for val in row["cells"]:
+                cells[ci].text = str(val)
+                for p in cells[ci].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                ci += 1
+            if group_col:
+                t = row.get("test")
+                if t:
+                    cells[ci].text = t["name"]; ci += 1
+                    cells[ci].text = t["stat"]; ci += 1
+                    cells[ci].text = fmt_p(t["p"])
+                    for p in cells[ci].paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    if t["p"] < alpha:
+                        for run in cells[ci].paragraphs[0].runs:
+                            run.bold = True
+                else:
+                    cells[ci].text = ""; ci += 1
+                    cells[ci].text = ""; ci += 1
+                    cells[ci].text = ""
+
+        if next_is_new_block:
+            for c in cells:
+                _set_cell_border(c, bottom={'sz': 8, 'val': 'single'})
+
+    for c in table.rows[-1].cells:
+        _set_cell_border(c, bottom={'sz': 12, 'val': 'single'})
+
+    for row in table.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                for run in p.runs:
+                    if run.font.size is None:
+                        run.font.size = Pt(9.5)
+
+    footnotes = [
+        f"Continuous variables reported as mean \u00B1 SD (assessed as normal via D'Agostino-Pearson "
+        f"test, \u03B1={alpha}) or median (IQR) otherwise; categorical variables reported as n (%)."
+    ]
+    if "chi2" in flags:
+        footnotes.append("Chi-square test of independence used for categorical comparisons with adequate expected cell counts.")
+    if "fisher" in flags:
+        footnotes.append("Fisher's exact test used in place of chi-square when a 2\u00D72 table had an expected cell count below 5.")
+    if "lowE" in flags:
+        footnotes.append("Caution: one or more categorical comparisons above have expected cell counts below 5; chi-square approximation may be unreliable.")
+    if "skipped" in flags:
+        footnotes.append("A statistical test could not be computed for one or more variables and was left blank.")
+    footnotes.append(f"Bold p-values indicate statistical significance at \u03B1={alpha}.")
+
+    doc.add_paragraph()  # spacer
+    for f in footnotes:
+        p = doc.add_paragraph(f)
+        for run in p.runs:
+            run.font.size = Pt(8.5)
+            run.italic = True
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # --------------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------------
@@ -463,14 +592,23 @@ if uploaded is not None:
         footnotes.append(f"Bold p-values indicate statistical significance at \u03B1={result_alpha}.")
         st.caption("  \n".join(footnotes))
 
-        csv_buf = io.StringIO()
-        pd.DataFrame(csv_rows).to_csv(csv_buf, index=False, header=False)
-        st.download_button("Download CSV", csv_buf.getvalue(), file_name="table1.csv", mime="text/csv")
+        dl_col1, dl_col2, dl_col3 = st.columns(3)
 
-        excel_buf = io.BytesIO()
-        pd.DataFrame(csv_rows[1:], columns=csv_rows[0]).to_excel(excel_buf, index=False, sheet_name="Table 1")
-        st.download_button("Download Excel", excel_buf.getvalue(), file_name="table1.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with dl_col1:
+            csv_buf = io.StringIO()
+            pd.DataFrame(csv_rows).to_csv(csv_buf, index=False, header=False)
+            st.download_button("Download CSV", csv_buf.getvalue(), file_name="table1.csv", mime="text/csv")
+
+        with dl_col2:
+            excel_buf = io.BytesIO()
+            pd.DataFrame(csv_rows[1:], columns=csv_rows[0]).to_excel(excel_buf, index=False, sheet_name="Table 1")
+            st.download_button("Download Excel", excel_buf.getvalue(), file_name="table1.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        with dl_col3:
+            docx_bytes = build_docx(header, display_rows, result_group_col, result_alpha, flags)
+            st.download_button("Download Word", docx_bytes, file_name="table1.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
 else:
     st.info("Upload a file to get started. Nothing leaves your machine — the app runs locally.")

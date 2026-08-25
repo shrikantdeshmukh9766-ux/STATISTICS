@@ -131,10 +131,40 @@ def fmt_num(x, d=1):
 # Table 1 builder
 # --------------------------------------------------------------------------
 
-def build_table1(df, var_meta, group_col, test_mode, alpha):
+def format_numeric_cell(values, display_mode, use_param):
+    """Format one group's numeric summary according to the chosen display mode.
+    display_mode: 'auto' | 'mean_sd' | 'median_iqr' | 'both'"""
+    if len(values) == 0:
+        return "—"
+    show_mean = display_mode == "mean_sd" or display_mode == "both" or (display_mode == "auto" and use_param)
+    show_median = display_mode == "median_iqr" or display_mode == "both" or (display_mode == "auto" and not use_param)
+    parts = []
+    if show_mean:
+        parts.append(f"{fmt_num(np.mean(values))} \u00B1 {fmt_num(np.std(values, ddof=1))}")
+    if show_median:
+        q1, med, q3 = np.percentile(values, [25, 50, 75])
+        parts.append(f"{fmt_num(med)} ({fmt_num(q1)}\u2013{fmt_num(q3)})")
+    return "; ".join(parts)
+
+
+def numeric_label(col, display_mode, use_param):
+    if display_mode == "mean_sd":
+        return f"{col}, mean \u00B1 SD"
+    if display_mode == "median_iqr":
+        return f"{col}, median (IQR)"
+    if display_mode == "both":
+        return f"{col}, mean \u00B1 SD; median (IQR)"
+    return f"{col}, mean \u00B1 SD" if use_param else f"{col}, median (IQR)"
+
+
+def build_table1(df, var_meta, group_col, test_mode, alpha, display_mode="auto"):
     """Returns (display_rows, csv_rows, footnote_flags).
     display_rows: list of dicts describing each printed row for st rendering.
     csv_rows: list of lists for CSV / clipboard export.
+    display_mode controls how numeric summaries are shown: 'auto' (mean±SD if
+    normal else median (IQR)), 'mean_sd', 'median_iqr', or 'both'. This is
+    independent of test_mode, which controls whether t-test/ANOVA or
+    Wilcoxon/Kruskal-Wallis is used for the comparison.
     """
     group_levels = []
     if group_col:
@@ -171,6 +201,8 @@ def build_table1(df, var_meta, group_col, test_mode, alpha):
 
             all_vals = numeric_series.dropna().values
 
+            # use_param governs which TEST is used (t-test/ANOVA vs Wilcoxon/KW);
+            # it is decided by test_mode regardless of the display_mode setting.
             if test_mode == "parametric":
                 use_param = True
             elif test_mode == "nonparametric":
@@ -181,24 +213,14 @@ def build_table1(df, var_meta, group_col, test_mode, alpha):
                 else:
                     use_param = is_normal(all_vals, alpha)
 
-            label = f"{col}, mean \u00B1 SD" if use_param else f"{col}, median (IQR)"
+            label = numeric_label(col, display_mode, use_param)
 
             cells = []
             if group_col:
                 for g in group_arrays:
-                    if len(g) == 0:
-                        cells.append("—")
-                    elif use_param:
-                        cells.append(f"{fmt_num(np.mean(g))} \u00B1 {fmt_num(np.std(g, ddof=1))}")
-                    else:
-                        q1, med, q3 = np.percentile(g, [25, 50, 75])
-                        cells.append(f"{fmt_num(med)} ({fmt_num(q1)}\u2013{fmt_num(q3)})")
+                    cells.append(format_numeric_cell(g, display_mode, use_param))
             else:
-                if use_param:
-                    cells.append(f"{fmt_num(np.mean(all_vals))} \u00B1 {fmt_num(np.std(all_vals, ddof=1))}")
-                else:
-                    q1, med, q3 = np.percentile(all_vals, [25, 50, 75])
-                    cells.append(f"{fmt_num(med)} ({fmt_num(q1)}\u2013{fmt_num(q3)})")
+                cells.append(format_numeric_cell(all_vals, display_mode, use_param))
 
             test_result = None
             if group_col and len(group_levels) >= 2:
@@ -353,7 +375,18 @@ def _set_cell_border(cell, **kwargs):
             el.set(qn('w:color'), spec.get('color', '000000'))
 
 
-def build_docx(header, display_rows, group_col, alpha, flags,
+def descriptive_footnote(display_mode, alpha):
+    if display_mode == "mean_sd":
+        return "Continuous variables reported as mean \u00B1 SD; categorical variables reported as n (%)."
+    if display_mode == "median_iqr":
+        return "Continuous variables reported as median (IQR); categorical variables reported as n (%)."
+    if display_mode == "both":
+        return "Continuous variables reported as mean \u00B1 SD and median (IQR); categorical variables reported as n (%)."
+    return (f"Continuous variables reported as mean \u00B1 SD (assessed as normal via D'Agostino-Pearson "
+            f"test, \u03B1={alpha}) or median (IQR) otherwise; categorical variables reported as n (%).")
+
+
+def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto",
                 title="Table 1. Baseline characteristics"):
     """Build a Word document with a three-line (journal-style) table."""
     doc = Document()
@@ -428,10 +461,7 @@ def build_docx(header, display_rows, group_col, alpha, flags,
                     if run.font.size is None:
                         run.font.size = Pt(9.5)
 
-    footnotes = [
-        f"Continuous variables reported as mean \u00B1 SD (assessed as normal via D'Agostino-Pearson "
-        f"test, \u03B1={alpha}) or median (IQR) otherwise; categorical variables reported as n (%)."
-    ]
+    footnotes = [descriptive_footnote(display_mode, alpha)]
     if "chi2" in flags:
         footnotes.append("Chi-square test of independence used for categorical comparisons with adequate expected cell counts.")
     if "fisher" in flags:
@@ -540,6 +570,16 @@ if uploaded is not None:
         )
         group_col = None if group_col == "— None (descriptive only) —" else group_col
 
+        display_mode = st.radio(
+            "Descriptive statistics display",
+            options=["auto", "mean_sd", "median_iqr", "both"],
+            format_func=lambda x: {"auto": "Auto (normality-based)",
+                                    "mean_sd": "Mean \u00B1 SD",
+                                    "median_iqr": "Median (IQR)",
+                                    "both": "Both"}[x],
+            horizontal=True,
+        )
+
     with col2:
         test_mode = st.radio(
             "Numeric test selection",
@@ -549,6 +589,8 @@ if uploaded is not None:
                                     "nonparametric": "Force non-parametric"}[x],
             horizontal=True,
         )
+        st.caption("Display and test selection are independent — e.g. you can show both mean\u00B1SD "
+                    "and median (IQR) while still testing with Wilcoxon based on normality.")
 
     with col3:
         alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5,
@@ -567,20 +609,17 @@ if uploaded is not None:
             st.info(f"Groups in **{group_col}**: {counts}")
 
     if st.button("Generate Table 1", type="primary", disabled=not can_generate):
-        header, display_rows, csv_rows, flags = build_table1(df, var_meta, group_col, test_mode, alpha)
-        st.session_state["result"] = (header, display_rows, csv_rows, flags, group_col, alpha)
+        header, display_rows, csv_rows, flags = build_table1(df, var_meta, group_col, test_mode, alpha, display_mode)
+        st.session_state["result"] = (header, display_rows, csv_rows, flags, group_col, alpha, display_mode)
 
     if "result" in st.session_state:
-        header, display_rows, csv_rows, flags, result_group_col, result_alpha = st.session_state["result"]
+        header, display_rows, csv_rows, flags, result_group_col, result_alpha, result_display_mode = st.session_state["result"]
 
         st.markdown("### Table 1. Baseline characteristics")
         st.markdown(render_table_markdown(header, display_rows, result_group_col, result_alpha),
                      unsafe_allow_html=True)
 
-        footnotes = [
-            f"Continuous variables reported as mean \u00B1 SD (assessed as normal via D'Agostino-Pearson "
-            f"test, \u03B1={result_alpha}) or median (IQR) otherwise; categorical variables reported as n (%)."
-        ]
+        footnotes = [descriptive_footnote(result_display_mode, result_alpha)]
         if "chi2" in flags:
             footnotes.append("Chi-square test of independence used for categorical comparisons with adequate expected cell counts.")
         if "fisher" in flags:
@@ -606,7 +645,7 @@ if uploaded is not None:
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         with dl_col3:
-            docx_bytes = build_docx(header, display_rows, result_group_col, result_alpha, flags)
+            docx_bytes = build_docx(header, display_rows, result_group_col, result_alpha, flags, result_display_mode)
             st.download_button("Download Word", docx_bytes, file_name="table1.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 

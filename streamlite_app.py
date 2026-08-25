@@ -197,12 +197,16 @@ def build_table1(df, var_meta, group_col, test_mode, alpha):
 
             test_result = None
             if group_col and len(group_levels) >= 2:
-                nonempty = [g for g in group_arrays if len(g) > 0]
+                nonempty = [g for g in group_arrays if len(g) > 1]  # need >=2 points per group for variance
                 if len(nonempty) >= 2:
-                    if len(group_levels) == 2:
-                        test_result = welch_t_test(*nonempty) if use_param else mann_whitney_test(*nonempty)
-                    else:
-                        test_result = anova_test(nonempty) if use_param else kruskal_test(nonempty)
+                    try:
+                        if len(group_levels) == 2:
+                            test_result = welch_t_test(*nonempty) if use_param else mann_whitney_test(*nonempty)
+                        else:
+                            test_result = anova_test(nonempty) if use_param else kruskal_test(nonempty)
+                    except Exception:
+                        test_result = None
+                        flags.add("skipped")
 
             display_rows.append({"kind": "var", "label": label, "cells": cells, "test": test_result})
             csv_rows.append([label, *cells,
@@ -217,18 +221,34 @@ def build_table1(df, var_meta, group_col, test_mode, alpha):
 
             contingency = None
             test_result = None
-            if group_col and len(group_levels) >= 2:
+            if group_col and len(group_levels) >= 2 and len(levels) >= 2:
                 group_series = df[group_col].astype(str).str.strip()
                 contingency = [[int(((series == lv) & (group_series == glv)).sum()) for glv in group_levels]
                                for lv in levels]
-                res = chi_or_fisher_test(contingency)
-                test_result = res
-                if res["name"].startswith("Fisher"):
-                    flags.add("fisher")
-                else:
-                    flags.add("chi2")
-                    if res["min_expected"] < 5:
-                        flags.add("lowE")
+                # Skip the test if any row/column is entirely zero — chi2_contingency
+                # (and Fisher's exact) require every row and column to have at least
+                # one observation, otherwise the table is degenerate.
+                arr = np.array(contingency)
+                if arr.size > 0 and arr.shape[0] >= 2 and arr.shape[1] >= 2 \
+                        and (arr.sum(axis=0) > 0).all() and (arr.sum(axis=1) > 0).all():
+                    try:
+                        res = chi_or_fisher_test(contingency)
+                        test_result = res
+                        if res["name"].startswith("Fisher"):
+                            flags.add("fisher")
+                        else:
+                            flags.add("chi2")
+                            if res["min_expected"] < 5:
+                                flags.add("lowE")
+                    except Exception:
+                        test_result = None
+                        flags.add("skipped")
+            elif group_col:
+                # Build a zero contingency table skeleton for the n(%) display below,
+                # even though no test is run (fewer than 2 non-empty levels/groups).
+                group_series = df[group_col].astype(str).str.strip()
+                contingency = [[int(((series == lv) & (group_series == glv)).sum()) for glv in group_levels]
+                               for lv in levels]
 
             display_rows.append({"kind": "varheader", "label": f"{col}, n (%)"})
             csv_rows.append([f"{col}, n (%)"])
@@ -438,6 +458,8 @@ if uploaded is not None:
             footnotes.append("Fisher's exact test used in place of chi-square when a 2\u00D72 table had an expected cell count below 5.")
         if "lowE" in flags:
             footnotes.append("Caution: one or more categorical comparisons above have expected cell counts below 5; chi-square approximation may be unreliable.")
+        if "skipped" in flags:
+            footnotes.append("Note: a statistical test could not be computed for one or more variables (e.g. insufficient data in a group) and was left blank.")
         footnotes.append(f"Bold p-values indicate statistical significance at \u03B1={result_alpha}.")
         st.caption("  \n".join(footnotes))
 

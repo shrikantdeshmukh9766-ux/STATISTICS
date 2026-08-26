@@ -130,7 +130,7 @@ def fmt_p(p):
     return "<0.001" if p < 0.001 else f"{p:.3f}"
 
 
-def fmt_num(x, d=1):
+def fmt_num(x, d=3):
     return f"{x:.{d}f}"
 
 
@@ -295,11 +295,11 @@ def build_table1(df, var_meta, group_col, test_mode, alpha, display_mode="auto")
                         n = contingency[i][gi]
                         gtotal = (group_series == glv).sum()
                         pct = 100 * n / gtotal if gtotal else 0.0
-                        cells.append(f"{n} ({pct:.1f}%)")
+                        cells.append(f"{n} ({pct:.2f}%)")
                 else:
                     n = int((series == lv).sum())
                     pct = 100 * n / len(df) if len(df) else 0.0
-                    cells.append(f"{n} ({pct:.1f}%)")
+                    cells.append(f"{n} ({pct:.2f}%)")
 
                 is_last = i == len(levels) - 1
                 display_rows.append({"kind": "level", "label": lv, "cells": cells,

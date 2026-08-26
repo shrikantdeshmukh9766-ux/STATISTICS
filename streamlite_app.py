@@ -33,6 +33,7 @@ from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from openpyxl.styles import Font as OpenpyxlFont
 
 st.set_page_config(page_title="Stream-lite · Baseline Table Builder", layout="wide")
 
@@ -53,6 +54,12 @@ def detect_type(series: pd.Series):
     if numeric_ratio >= 0.9 and unique_n > 10:
         return "numerical", n, unique_n
     return "categorical", n, unique_n
+
+
+def effective_type(meta):
+    """Resolve a variable's working type: if the user left it on 'auto',
+    use the auto-detected type; otherwise use their manual override."""
+    return meta["detected"] if meta["type"] == "auto" else meta["type"]
 
 
 def is_normal(arr, alpha):
@@ -186,7 +193,7 @@ def build_table1(df, var_meta, group_col, test_mode, alpha, display_mode="auto")
     variables = [c for c in df.columns if var_meta[c]["use"] and c != group_col]
 
     for col in variables:
-        vtype = var_meta[col]["type"]
+        vtype = effective_type(var_meta[col])
 
         if vtype == "numerical":
             numeric_series = pd.to_numeric(df[col], errors="coerce")
@@ -309,13 +316,13 @@ def render_table_markdown(header, display_rows, group_col, alpha):
     """Render the Table 1 as an HTML table with a three-line (journal-style) look."""
     css = """
     <style>
-    table.pub { width:100%; border-collapse:collapse; font-family: Georgia, serif; font-size: 14px; }
+    table.pub { width:100%; border-collapse:collapse; font-family: Calibri, Candara, Segoe, "Segoe UI", Optima, Arial, sans-serif; font-size: 9pt; }
     table.pub thead th { border-top:2px solid #1E2A32; border-bottom:1px solid #1E2A32;
-                          padding:8px 10px; text-align:left; font-family: -apple-system, sans-serif; }
+                          padding:8px 10px; text-align:left; font-family: inherit; }
     table.pub tbody td { padding:5px 10px; }
     table.pub tbody tr.var td { font-weight:700; padding-top:10px; }
     table.pub tbody tr.level td.name { padding-left:20px; color:#555; font-weight:400; }
-    table.pub td.stat { font-family: ui-monospace, Consolas, monospace; text-align:center; font-size:12.5px;}
+    table.pub td.stat { font-family: inherit; text-align:center; font-size:9pt;}
     table.pub td.sig { font-weight:700; }
     table.pub tbody tr.lastrow td { border-bottom:2px solid #1E2A32; padding-bottom:10px; }
     </style>
@@ -375,6 +382,24 @@ def _set_cell_border(cell, **kwargs):
             el.set(qn('w:color'), spec.get('color', '000000'))
 
 
+def _set_run_font(run, name="Calibri", size=9, bold=None, italic=None):
+    run.font.name = name
+    run.font.size = Pt(size)
+    # Ensure the font also applies to complex-script/east-asian text runs in Word
+    rPr = run._element.get_or_add_rPr()
+    rFonts = rPr.find(qn('w:rFonts'))
+    if rFonts is None:
+        rFonts = OxmlElement('w:rFonts')
+        rPr.append(rFonts)
+    rFonts.set(qn('w:ascii'), name)
+    rFonts.set(qn('w:hAnsi'), name)
+    rFonts.set(qn('w:cs'), name)
+    if bold is not None:
+        run.font.bold = bold
+    if italic is not None:
+        run.font.italic = italic
+
+
 def descriptive_footnote(display_mode, alpha):
     if display_mode == "mean_sd":
         return "Continuous variables reported as mean \u00B1 SD; categorical variables reported as n (%)."
@@ -388,11 +413,19 @@ def descriptive_footnote(display_mode, alpha):
 
 def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto",
                 title="Table 1. Baseline characteristics"):
-    """Build a Word document with a three-line (journal-style) table."""
+    """Build a Word document with a three-line (journal-style) table.
+    All table and footnote text uses Calibri 9pt."""
     doc = Document()
+
+    # Set the document default (Normal style) to Calibri 9pt so anything
+    # not explicitly styled below still matches.
+    normal = doc.styles["Normal"]
+    normal.font.name = "Calibri"
+    normal.font.size = Pt(9)
+
     h = doc.add_heading(title, level=2)
     for r in h.runs:
-        r.font.size = Pt(13)
+        _set_run_font(r, size=11, bold=True)
 
     ncols = len(header)
     table = doc.add_table(rows=1, cols=ncols)
@@ -403,8 +436,7 @@ def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto
         hdr_cells[i].text = str(htext)
         for p in hdr_cells[i].paragraphs:
             for run in p.runs:
-                run.bold = True
-                run.font.size = Pt(10)
+                _set_run_font(run, size=9, bold=True)
         _set_cell_border(hdr_cells[i], top={'sz': 12, 'val': 'single'},
                           bottom={'sz': 8, 'val': 'single'})
 
@@ -417,31 +449,38 @@ def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto
         if row["kind"] == "varheader":
             cells[0].text = row["label"]
             for run in cells[0].paragraphs[0].runs:
-                run.bold = True
+                _set_run_font(run, size=9, bold=True)
             for c in cells[1:]:
                 c.text = ""
         else:
             label = ("    " + row["label"]) if row["kind"] == "level" else row["label"]
             cells[0].text = label
             for run in cells[0].paragraphs[0].runs:
-                run.bold = (row["kind"] == "var")
+                _set_run_font(run, size=9, bold=(row["kind"] == "var"))
             ci = 1
             for val in row["cells"]:
                 cells[ci].text = str(val)
                 for p in cells[ci].paragraphs:
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in p.runs:
+                        _set_run_font(run, size=9)
                 ci += 1
             if group_col:
                 t = row.get("test")
                 if t:
-                    cells[ci].text = t["name"]; ci += 1
-                    cells[ci].text = t["stat"]; ci += 1
+                    cells[ci].text = t["name"]
+                    for run in cells[ci].paragraphs[0].runs:
+                        _set_run_font(run, size=9)
+                    ci += 1
+                    cells[ci].text = t["stat"]
+                    for run in cells[ci].paragraphs[0].runs:
+                        _set_run_font(run, size=9)
+                    ci += 1
                     cells[ci].text = fmt_p(t["p"])
                     for p in cells[ci].paragraphs:
                         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    if t["p"] < alpha:
-                        for run in cells[ci].paragraphs[0].runs:
-                            run.bold = True
+                        for run in p.runs:
+                            _set_run_font(run, size=9, bold=(t["p"] < alpha))
                 else:
                     cells[ci].text = ""; ci += 1
                     cells[ci].text = ""; ci += 1
@@ -459,7 +498,7 @@ def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto
             for p in cell.paragraphs:
                 for run in p.runs:
                     if run.font.size is None:
-                        run.font.size = Pt(9.5)
+                        _set_run_font(run, size=9)
 
     footnotes = [descriptive_footnote(display_mode, alpha)]
     if "chi2" in flags:
@@ -476,8 +515,7 @@ def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto
     for f in footnotes:
         p = doc.add_paragraph(f)
         for run in p.runs:
-            run.font.size = Pt(8.5)
-            run.italic = True
+            _set_run_font(run, size=9, italic=True)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -501,30 +539,51 @@ uploaded = st.file_uploader("Excel (.xlsx/.xls) or CSV. First row must be column
                              type=["xlsx", "xls", "csv"])
 
 if uploaded is not None:
+    is_excel = not uploaded.name.lower().endswith(".csv")
+    sheet_name = None
+
     try:
-        if uploaded.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded)
+        if is_excel:
+            xls = pd.ExcelFile(uploaded)
+            sheet_names = xls.sheet_names
+            if len(sheet_names) > 1:
+                sheet_name = st.selectbox("Select sheet", options=sheet_names)
+            else:
+                sheet_name = sheet_names[0]
+            df = pd.read_excel(xls, sheet_name=sheet_name)
         else:
-            df = pd.read_excel(uploaded)
+            df = pd.read_csv(uploaded)
     except Exception as e:
         st.error(f"Could not read that file: {e}")
         st.stop()
 
-    st.success(f"Loaded **{uploaded.name}** — {len(df)} rows, {len(df.columns)} columns")
+    st.success(f"Loaded **{uploaded.name}**"
+                + (f" · sheet **{sheet_name}**" if sheet_name else "")
+                + f" — {len(df)} rows, {len(df.columns)} columns")
 
     st.markdown("### 2. Variable types")
     st.caption(
-        "Stream-lite guesses numerical vs. categorical from the data. "
-        "Override anything it gets wrong, and uncheck variables to exclude them."
+        "Stream-lite guesses numerical vs. categorical from the data, but no variable is "
+        "included automatically — check **Use** for each variable you want in the table, "
+        "and change **Type** if 'Auto' picked the wrong one."
     )
 
-    if "var_meta" not in st.session_state or st.session_state.get("_last_file") != uploaded.name:
+    dataset_key = f"{uploaded.name}::{sheet_name}"
+    if "var_meta" not in st.session_state or st.session_state.get("_last_file") != dataset_key:
         var_meta = {}
+        total_rows = len(df)
         for col in df.columns:
             vtype, n, unique_n = detect_type(df[col])
-            var_meta[col] = {"type": vtype, "detected": vtype, "use": True, "n": n, "unique": unique_n}
+            var_meta[col] = {
+                "type": "auto",
+                "detected": vtype,
+                "use": False,
+                "n": n,
+                "missing": total_rows - n,
+                "unique": unique_n,
+            }
         st.session_state["var_meta"] = var_meta
-        st.session_state["_last_file"] = uploaded.name
+        st.session_state["_last_file"] = dataset_key
 
     var_meta = st.session_state["var_meta"]
 
@@ -532,9 +591,10 @@ if uploaded is not None:
         {
             "Variable": col,
             "Use": var_meta[col]["use"],
-            "Detected": var_meta[col]["detected"].capitalize(),
             "Type": var_meta[col]["type"],
+            "Auto-detected": var_meta[col]["detected"].capitalize(),
             "n (non-missing)": var_meta[col]["n"],
+            "n (missing)": var_meta[col]["missing"],
             "Unique values": var_meta[col]["unique"],
         }
         for col in df.columns
@@ -544,10 +604,11 @@ if uploaded is not None:
         editor_df,
         column_config={
             "Use": st.column_config.CheckboxColumn(required=True),
-            "Type": st.column_config.SelectboxColumn(options=["numerical", "categorical"], required=True),
-            "Detected": st.column_config.TextColumn(disabled=True),
+            "Type": st.column_config.SelectboxColumn(options=["auto", "numerical", "categorical"], required=True),
+            "Auto-detected": st.column_config.TextColumn(disabled=True),
             "Variable": st.column_config.TextColumn(disabled=True),
             "n (non-missing)": st.column_config.NumberColumn(disabled=True),
+            "n (missing)": st.column_config.NumberColumn(disabled=True),
             "Unique values": st.column_config.NumberColumn(disabled=True),
         },
         hide_index=True,
@@ -560,7 +621,7 @@ if uploaded is not None:
         var_meta[row["Variable"]]["type"] = row["Type"]
 
     st.markdown("### 3. Grouping & test selection")
-    categorical_cols = [c for c in df.columns if var_meta[c]["type"] == "categorical"]
+    categorical_cols = [c for c in df.columns if effective_type(var_meta[c]) == "categorical"]
 
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
@@ -596,7 +657,12 @@ if uploaded is not None:
         alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5,
                                  value=0.05, step=0.01)
 
+    n_selected = sum(1 for c in df.columns if var_meta[c]["use"] and c != group_col)
+
     can_generate = True
+    if n_selected == 0:
+        st.warning("No variables selected — check **Use** for at least one variable in the table above.")
+        can_generate = False
     if group_col:
         levels = df[group_col].dropna().astype(str).str.strip().unique().tolist()
         counts = ", ".join(
@@ -640,7 +706,17 @@ if uploaded is not None:
 
         with dl_col2:
             excel_buf = io.BytesIO()
-            pd.DataFrame(csv_rows[1:], columns=csv_rows[0]).to_excel(excel_buf, index=False, sheet_name="Table 1")
+            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                pd.DataFrame(csv_rows[1:], columns=csv_rows[0]).to_excel(writer, index=False, sheet_name="Table 1")
+                ws = writer.sheets["Table 1"]
+                calibri9 = OpenpyxlFont(name="Calibri", size=9)
+                for xl_row in ws.iter_rows():
+                    for cell in xl_row:
+                        bold = cell.row == 1
+                        cell.font = OpenpyxlFont(name="Calibri", size=9, bold=bold)
+                for column_cells in ws.columns:
+                    length = max(len(str(c.value)) if c.value is not None else 0 for c in column_cells)
+                    ws.column_dimensions[column_cells[0].column_letter].width = min(max(length + 2, 10), 45)
             st.download_button("Download Excel", excel_buf.getvalue(), file_name="table1.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 

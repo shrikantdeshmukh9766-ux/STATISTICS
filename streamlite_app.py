@@ -124,6 +124,125 @@ def chi_or_fisher_test(table):
             "p": float(p), "min_expected": min_e}
 
 
+def compute_or_ci(a, b, c, d, alpha=0.05):
+    """Crude (unadjusted) odds ratio and Wald 95% CI for a 2x2 table:
+           Event   Non-event
+    Exposed   a        b
+    Reference c        d
+    Applies the Haldane-Anscombe 0.5 correction to all four cells if any
+    cell is zero, to avoid an undefined or infinite odds ratio."""
+    if min(a, b, c, d) == 0:
+        a, b, c, d = a + 0.5, b + 0.5, c + 0.5, d + 0.5
+    or_val = (a * d) / (b * c)
+    se = np.sqrt(1 / a + 1 / b + 1 / c + 1 / d)
+    z = stats.norm.ppf(1 - alpha / 2)
+    log_or = np.log(or_val)
+    ci_low = np.exp(log_or - z * se)
+    ci_high = np.exp(log_or + z * se)
+    return or_val, ci_low, ci_high
+
+
+def fit_logistic_regression(X, y, max_iter=100, tol=1e-8):
+    """Binomial logistic regression via IRLS (Newton-Raphson / Fisher scoring).
+    X must include an intercept column. Returns (beta, se, converged).
+    Validated against sklearn's unregularized LogisticRegression and against
+    the closed-form crude odds ratio for the single-predictor case."""
+    n, p = X.shape
+    beta = np.zeros(p)
+    converged = False
+    for _ in range(max_iter):
+        eta = np.clip(X @ beta, -35, 35)
+        prob = 1 / (1 + np.exp(-eta))
+        W = np.clip(prob * (1 - prob), 1e-10, None)
+        XtWX = X.T @ (X * W[:, None])
+        XtR = X.T @ (y - prob)
+        try:
+            delta = np.linalg.solve(XtWX, XtR)
+        except np.linalg.LinAlgError:
+            delta = np.linalg.lstsq(XtWX, XtR, rcond=None)[0]
+        beta_new = beta + delta
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            converged = True
+            break
+        beta = beta_new
+    eta = np.clip(X @ beta, -35, 35)
+    prob = 1 / (1 + np.exp(-eta))
+    W = np.clip(prob * (1 - prob), 1e-10, None)
+    XtWX = X.T @ (X * W[:, None])
+    try:
+        vcov = np.linalg.inv(XtWX)
+    except np.linalg.LinAlgError:
+        vcov = np.linalg.pinv(XtWX)
+        converged = False
+    se = np.sqrt(np.clip(np.diag(vcov), 0, None))
+    return beta, se, converged
+
+
+def compute_adjusted_or(df, exposure_vars, baselines, outcome_col, event_level, nonevent_level, alpha):
+    """Multivariable logistic regression adjusting for all selected exposure
+    variables simultaneously. Returns (results, flags) where results maps
+    (var, level) -> {'or','ci_low','ci_high','p','reliable'} for every
+    non-reference level of every exposure variable."""
+    outcome_series = df[outcome_col].astype(str).str.strip()
+    mask = outcome_series.isin([event_level, nonevent_level])
+    for var in exposure_vars:
+        var_series = df[var].astype(str).str.strip()
+        var_series = var_series.where(df[var].notna() & (var_series != ""), other=np.nan)
+        mask = mask & var_series.notna()
+
+    sub = df.loc[mask].copy()
+    y = (sub[outcome_col].astype(str).str.strip() == event_level).astype(float).values
+
+    colnames = []
+    columns = [np.ones(len(sub))]
+    for var in exposure_vars:
+        series = sub[var].astype(str).str.strip()
+        levels = sorted(series.dropna().unique().tolist())
+        baseline = baselines.get(var)
+        if baseline not in levels:
+            baseline = levels[0] if levels else None
+        for lv in levels:
+            if lv == baseline:
+                continue
+            columns.append((series == lv).astype(float).values)
+            colnames.append((var, lv))
+
+    flags = set()
+    results = {}
+    if len(columns) <= 1 or len(np.unique(y)) < 2:
+        flags.add("adj_skipped")
+        return results, flags
+
+    X = np.column_stack(columns)
+    try:
+        beta, se, converged = fit_logistic_regression(X, y)
+    except Exception:
+        flags.add("adj_skipped")
+        return results, flags
+
+    if not converged:
+        flags.add("adj_unstable")
+
+    z = stats.norm.ppf(1 - alpha / 2)
+    for i, (var, lv) in enumerate(colnames):
+        idx = i + 1  # offset for intercept
+        b, s = beta[idx], se[idx]
+        reliable = converged and abs(b) < 15 and s < 10
+        if reliable:
+            or_val = float(np.exp(b))
+            ci_low = float(np.exp(b - z * s))
+            ci_high = float(np.exp(b + z * s))
+            p_val = float(2 * (1 - stats.norm.cdf(abs(b / s)))) if s > 0 else float("nan")
+            results[(var, lv)] = {"or": or_val, "ci_low": ci_low, "ci_high": ci_high,
+                                   "p": p_val, "reliable": True}
+        else:
+            results[(var, lv)] = {"reliable": False}
+            flags.add("adj_unstable")
+
+    return results, flags
+
+
 def fmt_p(p):
     if p is None or (isinstance(p, float) and np.isnan(p)):
         return "—"
@@ -360,6 +479,157 @@ def render_table_markdown(header, display_rows, group_col, alpha):
     return html
 
 
+# --------------------------------------------------------------------------
+# Odds ratio table builder
+# --------------------------------------------------------------------------
+
+def build_or_table(df, exposure_vars, outcome_col, event_level, baselines, alpha,
+                     adjusted_results=None, show_adjusted=False):
+    """Build a Table 2-style odds ratio table: n (%) split by a binary
+    outcome, with crude OR (95% CI) & p-value, and (if show_adjusted) adjusted
+    OR (95% CI) & p-value from a multivariable logistic regression, for each
+    exposure level against a chosen reference level.
+
+    Returns (header, display_rows, csv_rows, flags).
+    """
+    adjusted_results = adjusted_results or {}
+    show_adj = show_adjusted
+
+    outcome_series = df[outcome_col].astype(str).str.strip()
+    outcome_levels = sorted(outcome_series.dropna().unique().tolist())
+    nonevent_candidates = [lv for lv in outcome_levels if lv != event_level]
+    nonevent_level = nonevent_candidates[0] if nonevent_candidates else None
+
+    n_event_total = int((outcome_series == event_level).sum())
+    n_nonevent_total = int((outcome_series == nonevent_level).sum()) if nonevent_level else 0
+
+    header = ["Variable", f"{event_level} (n={n_event_total})",
+               f"{nonevent_level} (n={n_nonevent_total})" if nonevent_level else "Other",
+               "OR (95% CI)", "p"]
+    if show_adj:
+        header += ["Adj-OR (95% CI)", "Adj-p"]
+    csv_rows = [header]
+    display_rows = []
+    flags = set()
+
+    for var in exposure_vars:
+        series = df[var].astype(str).str.strip()
+        series = series.where(df[var].notna() & (series != ""), other=np.nan)
+        levels = sorted(series.dropna().unique().tolist())
+
+        display_rows.append({"kind": "varheader", "label": f"{var}, n (%)"})
+        csv_rows.append([f"{var}, n (%)"])
+
+        baseline = baselines.get(var)
+        if baseline not in levels or len(levels) < 2 or nonevent_level is None:
+            flags.add("skipped")
+            continue
+
+        ordered_levels = [baseline] + [lv for lv in levels if lv != baseline]
+
+        for lv in ordered_levels:
+            n_event = int(((series == lv) & (outcome_series == event_level)).sum())
+            n_nonevent = int(((series == lv) & (outcome_series == nonevent_level)).sum())
+            pct_event = 100 * n_event / n_event_total if n_event_total else 0.0
+            pct_nonevent = 100 * n_nonevent / n_nonevent_total if n_nonevent_total else 0.0
+            cell_event = f"{n_event} ({pct_event:.2f}%)"
+            cell_nonevent = f"{n_nonevent} ({pct_nonevent:.2f}%)"
+
+            adj_or_str, adj_p_str, adj_sig = "", "", False
+
+            if lv == baseline:
+                or_str = "1.000 (Reference)"
+                p_str = "—"
+                is_sig = False
+                if show_adj:
+                    adj_or_str = "1.000 (Reference)"
+                    adj_p_str = "—"
+            else:
+                a, b = n_event, n_nonevent
+                c = int(((series == baseline) & (outcome_series == event_level)).sum())
+                d = int(((series == baseline) & (outcome_series == nonevent_level)).sum())
+                try:
+                    or_val, ci_low, ci_high = compute_or_ci(a, b, c, d, alpha)
+                    test_res = chi_or_fisher_test([[a, b], [c, d]])
+                    p_val = test_res["p"]
+                    p_str = fmt_p(p_val)
+                    or_str = f"{or_val:.3f} ({ci_low:.3f}\u2013{ci_high:.3f})"
+                    is_sig = p_val < alpha
+                    flags.add("fisher" if test_res["name"].startswith("Fisher") else "chi2")
+                except Exception:
+                    or_str, p_str, is_sig = "—", "—", False
+                    flags.add("skipped")
+
+                if show_adj:
+                    res = adjusted_results.get((var, lv))
+                    if res and res.get("reliable"):
+                        adj_or_str = f"{res['or']:.3f} ({res['ci_low']:.3f}\u2013{res['ci_high']:.3f})"
+                        adj_p_str = fmt_p(res["p"])
+                        adj_sig = res["p"] < alpha
+                    else:
+                        adj_or_str, adj_p_str = "—", "—"
+
+            row = {"kind": "level", "label": lv,
+                   "cells": [cell_event, cell_nonevent],
+                   "or": or_str, "p": p_str, "sig": is_sig}
+            csv_line = [f"  {lv}", cell_event, cell_nonevent, or_str, p_str]
+            if show_adj:
+                row["adj_or"] = adj_or_str
+                row["adj_p"] = adj_p_str
+                row["adj_sig"] = adj_sig
+                csv_line += [adj_or_str, adj_p_str]
+            display_rows.append(row)
+            csv_rows.append(csv_line)
+
+    return header, display_rows, csv_rows, flags
+
+
+def render_or_table_markdown(header, display_rows):
+    """Render the odds ratio table as an HTML table, same three-line look
+    as Table 1."""
+    css = """
+    <style>
+    table.pub2 { width:100%; border-collapse:collapse; font-family: Calibri, Candara, Segoe, "Segoe UI", Optima, Arial, sans-serif; font-size: 9pt; }
+    table.pub2 thead th { border-top:2px solid #1E2A32; border-bottom:1px solid #1E2A32;
+                          padding:8px 10px; text-align:left; font-family: inherit; }
+    table.pub2 tbody td { padding:5px 10px; }
+    table.pub2 tbody tr.var td { font-weight:700; padding-top:10px; }
+    table.pub2 tbody tr.level td.name { padding-left:20px; color:#555; font-weight:400; }
+    table.pub2 td.stat { font-family: inherit; text-align:center; font-size:9pt;}
+    table.pub2 td.sig { font-weight:700; }
+    table.pub2 tbody tr.lastrow td { border-bottom:2px solid #1E2A32; padding-bottom:10px; }
+    </style>
+    """
+    html = css + '<table class="pub2"><thead><tr>'
+    for h in header:
+        html += f"<th>{h}</th>"
+    html += "</tr></thead><tbody>"
+
+    for idx, row in enumerate(display_rows):
+        is_last_of_block = (idx == len(display_rows) - 1) or \
+                            (display_rows[idx + 1]["kind"] in ("var", "varheader"))
+        cls = "var" if row["kind"] == "varheader" else "level"
+        cls += " lastrow" if is_last_of_block else ""
+        html += f'<tr class="{cls}">'
+
+        if row["kind"] == "varheader":
+            html += f'<td>{row["label"]}</td>'
+            colspan = len(header) - 1
+            html += f'<td colspan="{colspan}"></td>'
+        else:
+            html += f'<td class="name">{row["label"]}</td>'
+            for c in row["cells"]:
+                html += f'<td class="stat">{c}</td>'
+            sig = "sig" if row.get("sig") else ""
+            html += f'<td class="stat">{row["or"]}</td><td class="stat {sig}">{row["p"]}</td>'
+            if "adj_or" in row:
+                adj_sig = "sig" if row.get("adj_sig") else ""
+                html += f'<td class="stat">{row["adj_or"]}</td><td class="stat {adj_sig}">{row["adj_p"]}</td>'
+        html += "</tr>"
+    html += "</tbody></table>"
+    return html
+
+
 def _set_cell_border(cell, **kwargs):
     """Add borders to a single table cell. kwargs like
     top={'sz':12,'val':'single','color':'000000'}."""
@@ -512,6 +782,120 @@ def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto
     footnotes.append(f"Bold p-values indicate statistical significance at \u03B1={alpha}.")
 
     doc.add_paragraph()  # spacer
+    for f in footnotes:
+        p = doc.add_paragraph(f)
+        for run in p.runs:
+            _set_run_font(run, size=9, italic=True)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_or_docx(header, display_rows, alpha, flags, event_level,
+                    title="Table 2. Odds ratios for outcome"):
+    """Word export of the odds ratio table, same Calibri 9pt three-line style."""
+    doc = Document()
+    normal = doc.styles["Normal"]
+    normal.font.name = "Calibri"
+    normal.font.size = Pt(9)
+
+    h = doc.add_heading(f"{title}: {event_level}", level=2)
+    for r in h.runs:
+        _set_run_font(r, size=11, bold=True)
+
+    ncols = len(header)
+    table = doc.add_table(rows=1, cols=ncols)
+    table.autofit = True
+
+    hdr_cells = table.rows[0].cells
+    for i, htext in enumerate(header):
+        hdr_cells[i].text = str(htext)
+        for p in hdr_cells[i].paragraphs:
+            for run in p.runs:
+                _set_run_font(run, size=9, bold=True)
+        _set_cell_border(hdr_cells[i], top={'sz': 12, 'val': 'single'},
+                          bottom={'sz': 8, 'val': 'single'})
+
+    n_rows = len(display_rows)
+    for idx, row in enumerate(display_rows):
+        cells = table.add_row().cells
+        is_last = idx == n_rows - 1
+        next_is_new_block = is_last or (display_rows[idx + 1]["kind"] == "varheader")
+
+        if row["kind"] == "varheader":
+            cells[0].text = row["label"]
+            for run in cells[0].paragraphs[0].runs:
+                _set_run_font(run, size=9, bold=True)
+            for c in cells[1:]:
+                c.text = ""
+        else:
+            cells[0].text = "    " + row["label"]
+            for run in cells[0].paragraphs[0].runs:
+                _set_run_font(run, size=9)
+            ci = 1
+            for val in row["cells"]:
+                cells[ci].text = str(val)
+                for p in cells[ci].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in p.runs:
+                        _set_run_font(run, size=9)
+                ci += 1
+            cells[ci].text = row["or"]
+            for p in cells[ci].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    _set_run_font(run, size=9)
+            ci += 1
+            cells[ci].text = row["p"]
+            for p in cells[ci].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    _set_run_font(run, size=9, bold=row.get("sig", False))
+            ci += 1
+
+            if "adj_or" in row:
+                cells[ci].text = row["adj_or"]
+                for p in cells[ci].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in p.runs:
+                        _set_run_font(run, size=9)
+                ci += 1
+                cells[ci].text = row["adj_p"]
+                for p in cells[ci].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in p.runs:
+                        _set_run_font(run, size=9, bold=row.get("adj_sig", False))
+
+        if next_is_new_block:
+            for c in cells:
+                _set_cell_border(c, bottom={'sz': 8, 'val': 'single'})
+
+    for c in table.rows[-1].cells:
+        _set_cell_border(c, bottom={'sz': 12, 'val': 'single'})
+
+    footnotes = [
+        "n (%) are column percentages within each outcome group. Odds ratios (OR) are crude "
+        "(unadjusted), computed against the reference category shown for each variable, "
+        "with the Haldane-Anscombe 0.5 correction applied when a cell count is zero."
+    ]
+    if any("adj_or" in r for r in display_rows):
+        footnotes.append(
+            "Adjusted odds ratios (Adj-OR) are from a multivariable logistic regression "
+            "including all selected exposure variables simultaneously (Wald 95% CI and p-value)."
+        )
+    if "chi2" in flags:
+        footnotes.append("Chi-square test of independence used for adequate expected cell counts.")
+    if "fisher" in flags:
+        footnotes.append("Fisher's exact test used in place of chi-square when a 2\u00D72 table had an expected cell count below 5.")
+    if "skipped" in flags:
+        footnotes.append("One or more comparisons could not be computed (e.g. fewer than 2 exposure levels) and were left blank.")
+    if "adj_unstable" in flags:
+        footnotes.append("Adjusted OR could not be reliably estimated for one or more levels (model did not converge or the estimate was unstable, e.g. due to sparse data) and was left blank.")
+    footnotes.append(f"Bold p-values indicate statistical significance at \u03B1={alpha}.")
+
+    doc.add_paragraph()
     for f in footnotes:
         p = doc.add_paragraph(f)
         for run in p.runs:
@@ -724,6 +1108,129 @@ if uploaded is not None:
             docx_bytes = build_docx(header, display_rows, result_group_col, result_alpha, flags, result_display_mode)
             st.download_button("Download Word", docx_bytes, file_name="table1.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+    st.markdown("---")
+    st.markdown("### 4. Odds ratio analysis (Table 2)")
+    st.caption(
+        "Select an outcome and one or more factor variables. For each factor you choose a "
+        "reference (baseline) category, and Stream-lite builds a Table 2: n (%) split by "
+        "outcome, crude OR (95% CI) & p, and — if requested — adjusted OR (95% CI) & p from "
+        "a multivariable logistic regression including all selected factors together."
+    )
+
+    binary_cat_cols = [c for c in df.columns if effective_type(var_meta[c]) == "categorical"
+                        and df[c].dropna().astype(str).str.strip().replace("", np.nan).dropna().nunique() == 2]
+    categorical_cols_all = [c for c in df.columns if effective_type(var_meta[c]) == "categorical"]
+
+    if not binary_cat_cols:
+        st.info("No binary (2-level) categorical variable found in your data — an odds ratio needs a "
+                 "two-level outcome (e.g. Yes/No, Case/Control).")
+    else:
+        or_col1, or_col2 = st.columns([2, 2])
+        with or_col1:
+            outcome_col = st.selectbox("1) Outcome variable", options=binary_cat_cols, key="or_outcome")
+            outcome_levels_avail = sorted(df[outcome_col].dropna().astype(str).str.strip().unique().tolist())
+            event_level = st.selectbox("Event level (the outcome of interest)",
+                                         options=outcome_levels_avail,
+                                         index=len(outcome_levels_avail) - 1, key="or_event")
+
+        with or_col2:
+            exposure_options = [c for c in categorical_cols_all if c != outcome_col]
+            exposure_vars = st.multiselect("1) Factor variable(s)", options=exposure_options, key="or_exposures")
+            or_alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5,
+                                         value=0.05, step=0.01, key="or_alpha")
+
+        include_adjusted = st.checkbox(
+            "Include adjusted OR (multivariable logistic regression across all selected factors)",
+            value=True, key="or_include_adj",
+            disabled=len(exposure_vars) < 1,
+        )
+
+        baselines = {}
+        if exposure_vars:
+            st.markdown("**2) Reference (baseline) category for each factor**")
+            base_cols = st.columns(min(3, len(exposure_vars)))
+            for i, var in enumerate(exposure_vars):
+                levels = sorted(df[var].dropna().astype(str).str.strip().unique().tolist())
+                with base_cols[i % len(base_cols)]:
+                    baselines[var] = st.selectbox(f"{var} baseline", options=levels, key=f"baseline_{var}")
+
+        can_generate_or = bool(exposure_vars) and outcome_col is not None
+
+        if st.button("Generate Odds Ratio Table", type="primary", disabled=not can_generate_or):
+            adjusted_results, adj_flags = {}, set()
+            if include_adjusted:
+                nonevent_candidates = [lv for lv in outcome_levels_avail if lv != event_level]
+                nonevent_level = nonevent_candidates[0] if nonevent_candidates else None
+                if nonevent_level:
+                    adjusted_results, adj_flags = compute_adjusted_or(
+                        df, exposure_vars, baselines, outcome_col, event_level, nonevent_level, or_alpha
+                    )
+
+            or_header, or_display_rows, or_csv_rows, or_flags = build_or_table(
+                df, exposure_vars, outcome_col, event_level, baselines, or_alpha,
+                adjusted_results=adjusted_results, show_adjusted=include_adjusted
+            )
+            or_flags = or_flags | adj_flags
+            st.session_state["or_result"] = (or_header, or_display_rows, or_csv_rows, or_flags, event_level, or_alpha)
+
+        if "or_result" in st.session_state:
+            (or_header, or_display_rows, or_csv_rows, or_flags,
+             or_result_event, or_result_alpha) = st.session_state["or_result"]
+
+            st.markdown(f"### Table 2. Odds ratios for outcome: {or_result_event}")
+            st.markdown(render_or_table_markdown(or_header, or_display_rows), unsafe_allow_html=True)
+
+            or_footnotes = [
+                "n (%) are column percentages within each outcome group. Odds ratios (OR) are crude "
+                "(unadjusted), computed against the reference category shown for each variable, "
+                "with the Haldane-Anscombe 0.5 correction applied when a cell count is zero."
+            ]
+            if any("adj_or" in r for r in or_display_rows):
+                or_footnotes.append(
+                    "Adjusted odds ratios (Adj-OR) are from a multivariable logistic regression "
+                    "including all selected factor variables simultaneously (Wald 95% CI and p-value)."
+                )
+            if "chi2" in or_flags:
+                or_footnotes.append("Chi-square test of independence used for adequate expected cell counts.")
+            if "fisher" in or_flags:
+                or_footnotes.append("Fisher's exact test used in place of chi-square when a 2\u00D72 table had an expected cell count below 5.")
+            if "skipped" in or_flags:
+                or_footnotes.append("One or more comparisons could not be computed (e.g. fewer than 2 exposure levels) and were left blank.")
+            if "adj_unstable" in or_flags:
+                or_footnotes.append("Adjusted OR could not be reliably estimated for one or more levels (model did not converge or the estimate was unstable, e.g. due to sparse data) and was left blank.")
+            or_footnotes.append(f"Bold p-values indicate statistical significance at \u03B1={or_result_alpha}.")
+            st.caption("  \n".join(or_footnotes))
+
+            or_dl1, or_dl2, or_dl3 = st.columns(3)
+
+            with or_dl1:
+                or_csv_buf = io.StringIO()
+                pd.DataFrame(or_csv_rows).to_csv(or_csv_buf, index=False, header=False)
+                st.download_button("Download CSV", or_csv_buf.getvalue(), file_name="table2_odds_ratios.csv",
+                                    mime="text/csv", key="or_csv_dl")
+
+            with or_dl2:
+                or_excel_buf = io.BytesIO()
+                with pd.ExcelWriter(or_excel_buf, engine="openpyxl") as writer:
+                    pd.DataFrame(or_csv_rows[1:], columns=or_csv_rows[0]).to_excel(writer, index=False, sheet_name="Table 2")
+                    ws = writer.sheets["Table 2"]
+                    for xl_row in ws.iter_rows():
+                        for cell in xl_row:
+                            bold = cell.row == 1
+                            cell.font = OpenpyxlFont(name="Calibri", size=9, bold=bold)
+                    for column_cells in ws.columns:
+                        length = max(len(str(c.value)) if c.value is not None else 0 for c in column_cells)
+                        ws.column_dimensions[column_cells[0].column_letter].width = min(max(length + 2, 10), 45)
+                st.download_button("Download Excel", or_excel_buf.getvalue(), file_name="table2_odds_ratios.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="or_xlsx_dl")
+
+            with or_dl3:
+                or_docx_bytes = build_or_docx(or_header, or_display_rows, or_result_alpha, or_flags, or_result_event)
+                st.download_button("Download Word", or_docx_bytes, file_name="table2_odds_ratios.docx",
+                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    key="or_docx_dl")
 
 else:
     st.info("Upload a file to get started. Nothing leaves your machine — the app runs locally.")

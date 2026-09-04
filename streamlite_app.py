@@ -33,6 +33,7 @@ from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from openpyxl import Workbook
 from openpyxl.styles import Font as OpenpyxlFont
 
 st.set_page_config(page_title="Stream-lite · Baseline Table Builder", layout="wide")
@@ -295,23 +296,33 @@ def build_table1(df, var_meta, group_col, test_mode, alpha, display_mode="auto",
 
             display_rows.append({"kind": "varheader", "label": f"{col}, n (%)"})
             csv_rows.append([f"{col}, n (%)"])
+            flags.add("catpct")
+
+            # Non-missing total for this variable, overall and per group. Used
+            # as the % denominator so missing values are excluded (rather than
+            # counting them against the group/overall total), giving true
+            # "percent of observed" values.
+            total_nonmissing = int(series.notna().sum())
+            group_nonmissing_totals = None
+            if group_col and levels:
+                group_nonmissing_totals = [sum(contingency[i][gi] for i in range(len(levels)))
+                                            for gi in range(len(group_levels))]
 
             for i, lv in enumerate(levels):
                 cells = []
                 if group_col:
-                    group_series = df[group_col].astype(str).str.strip()
                     row_total = sum(contingency[i]) if pct_mode == "row" else None
                     for gi, glv in enumerate(group_levels):
                         n = contingency[i][gi]
                         if pct_mode == "row":
                             denom = row_total
                         else:
-                            denom = (group_series == glv).sum()
+                            denom = group_nonmissing_totals[gi]
                         pct = 100 * n / denom if denom else 0.0
                         cells.append(f"{n} ({pct:.{pct_digits}f}%)")
                 else:
                     n = int((series == lv).sum())
-                    pct = 100 * n / len(df) if len(df) else 0.0
+                    pct = 100 * n / total_nonmissing if total_nonmissing else 0.0
                     cells.append(f"{n} ({pct:.{pct_digits}f}%)")
 
                 is_last = i == len(levels) - 1
@@ -435,6 +446,35 @@ def pct_basis_footnote(group_col, pct_mode):
             "group's total (columns sum to ~100%).")
 
 
+def build_excel(csv_rows, sheet_name="Table 1"):
+    """Build an .xlsx file directly with openpyxl (bypassing pandas'
+    ExcelWriter/openpyxl sheet-swap, which on some pandas/openpyxl/Python
+    version combinations raises 'IndexError: At least one sheet must be
+    visible'). csv_rows is the same list-of-lists used for the CSV export,
+    with csv_rows[0] as the header row."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+    ws.sheet_state = "visible"
+
+    for row in csv_rows:
+        ws.append(row)
+
+    for xl_row in ws.iter_rows():
+        for cell in xl_row:
+            bold = cell.row == 1
+            cell.font = OpenpyxlFont(name="Calibri", size=9, bold=bold)
+
+    for column_cells in ws.columns:
+        length = max((len(str(c.value)) if c.value is not None else 0) for c in column_cells)
+        ws.column_dimensions[column_cells[0].column_letter].width = min(max(length + 2, 10), 45)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto",
                 pct_mode="column", title="Table 1. Baseline characteristics"):
     """Build a Word document with a three-line (journal-style) table.
@@ -528,6 +568,9 @@ def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto
     pct_note = pct_basis_footnote(group_col, pct_mode)
     if pct_note:
         footnotes.append(pct_note)
+    if "catpct" in flags:
+        footnotes.append("Percentages for categorical variables are calculated among non-missing "
+                          "responses for that variable (missing values excluded from the denominator).")
     if "chi2" in flags:
         footnotes.append("Chi-square test of independence used for categorical comparisons with adequate expected cell counts.")
     if "fisher" in flags:
@@ -733,6 +776,9 @@ if uploaded is not None:
         pct_note = pct_basis_footnote(result_group_col, result_pct_mode)
         if pct_note:
             footnotes.append(pct_note)
+        if "catpct" in flags:
+            footnotes.append("Percentages for categorical variables are calculated among non-missing "
+                              "responses for that variable (missing values excluded from the denominator).")
         if "chi2" in flags:
             footnotes.append("Chi-square test of independence used for categorical comparisons with adequate expected cell counts.")
         if "fisher" in flags:
@@ -752,19 +798,8 @@ if uploaded is not None:
             st.download_button("Download CSV", csv_buf.getvalue(), file_name="table1.csv", mime="text/csv")
 
         with dl_col2:
-            excel_buf = io.BytesIO()
-            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                pd.DataFrame(csv_rows[1:], columns=csv_rows[0]).to_excel(writer, index=False, sheet_name="Table 1")
-                ws = writer.sheets["Table 1"]
-                calibri9 = OpenpyxlFont(name="Calibri", size=9)
-                for xl_row in ws.iter_rows():
-                    for cell in xl_row:
-                        bold = cell.row == 1
-                        cell.font = OpenpyxlFont(name="Calibri", size=9, bold=bold)
-                for column_cells in ws.columns:
-                    length = max(len(str(c.value)) if c.value is not None else 0 for c in column_cells)
-                    ws.column_dimensions[column_cells[0].column_letter].width = min(max(length + 2, 10), 45)
-            st.download_button("Download Excel", excel_buf.getvalue(), file_name="table1.xlsx",
+            excel_bytes = build_excel(csv_rows, sheet_name="Table 1")
+            st.download_button("Download Excel", excel_bytes, file_name="table1.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         with dl_col3:

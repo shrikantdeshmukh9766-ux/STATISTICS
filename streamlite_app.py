@@ -112,16 +112,24 @@ def kruskal_test(groups):
             "p": float(res.pvalue)}
 
 
-def chi_or_fisher_test(table):
+def chi_or_fisher_test(table, yates_correction=False):
     """RxC contingency table -> chi-square, auto-falling back to Fisher's
-    exact test for 2x2 tables with low expected counts."""
+    exact test for 2x2 tables with low expected counts.
+    yates_correction controls scipy's Yates' continuity correction, which
+    only has an effect on 2x2 tables (scipy silently ignores it otherwise).
+    Off by default, since the correction is conservative and not universally
+    recommended; many modern guidelines prefer the uncorrected chi-square or
+    Fisher's exact test for small 2x2 tables instead."""
     table = np.array(table)
-    chi2, p, dof, expected = stats.chi2_contingency(table)
+    chi2, p, dof, expected = stats.chi2_contingency(table, correction=yates_correction)
     min_e = float(expected.min())
     if table.shape == (2, 2) and min_e < 5:
         _, p_fisher = stats.fisher_exact(table)
         return {"name": "Fisher's exact test", "stat": "—", "p": float(p_fisher), "min_expected": min_e}
-    return {"name": "Chi-square test", "stat": f"\u03C7\u00B2={chi2:.2f}, df={dof}",
+    name = "Chi-square test"
+    if table.shape == (2, 2) and yates_correction:
+        name = "Chi-square test (Yates-corrected)"
+    return {"name": name, "stat": f"\u03C7\u00B2={chi2:.2f}, df={dof}",
             "p": float(p), "min_expected": min_e}
 
 
@@ -166,7 +174,7 @@ def numeric_label(col, display_mode, use_param):
 
 
 def build_table1(df, var_meta, group_col, test_mode, alpha, display_mode="auto",
-                  pct_mode="column", pct_digits=2):
+                  pct_mode="column", pct_digits=2, yates_correction=False):
     """Returns (display_rows, csv_rows, footnote_flags).
     display_rows: list of dicts describing each printed row for st rendering.
     csv_rows: list of lists for CSV / clipboard export.
@@ -182,6 +190,9 @@ def build_table1(df, var_meta, group_col, test_mode, alpha, display_mode="auto",
     (percentages are always of the overall n in that case).
     pct_digits controls the number of decimal places shown for all
     categorical percentages.
+    yates_correction controls whether Yates' continuity correction is applied
+    to the chi-square test for 2x2 tables. Off by default. Has no effect on
+    Fisher's exact test or on chi-square tables larger than 2x2.
     """
     group_levels = []
     if group_col:
@@ -276,7 +287,7 @@ def build_table1(df, var_meta, group_col, test_mode, alpha, display_mode="auto",
                 if arr.size > 0 and arr.shape[0] >= 2 and arr.shape[1] >= 2 \
                         and (arr.sum(axis=0) > 0).all() and (arr.sum(axis=1) > 0).all():
                     try:
-                        res = chi_or_fisher_test(contingency)
+                        res = chi_or_fisher_test(contingency, yates_correction=yates_correction)
                         test_result = res
                         if res["name"].startswith("Fisher"):
                             flags.add("fisher")
@@ -476,7 +487,7 @@ def build_excel(csv_rows, sheet_name="Table 1"):
 
 
 def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto",
-                pct_mode="column", title="Table 1. Baseline characteristics"):
+                pct_mode="column", yates_correction=False, title="Table 1. Baseline characteristics"):
     """Build a Word document with a three-line (journal-style) table.
     All table and footnote text uses Calibri 9pt."""
     doc = Document()
@@ -572,7 +583,10 @@ def build_docx(header, display_rows, group_col, alpha, flags, display_mode="auto
         footnotes.append("Percentages for categorical variables are calculated among non-missing "
                           "responses for that variable (missing values excluded from the denominator).")
     if "chi2" in flags:
-        footnotes.append("Chi-square test of independence used for categorical comparisons with adequate expected cell counts.")
+        chi2_note = "Chi-square test of independence used for categorical comparisons with adequate expected cell counts"
+        chi2_note += " (Yates' continuity correction applied to 2\u00D72 tables)." if yates_correction \
+            else " (no continuity correction applied)."
+        footnotes.append(chi2_note)
     if "fisher" in flags:
         footnotes.append("Fisher's exact test used in place of chi-square when a 2\u00D72 table had an expected cell count below 5.")
     if "lowE" in flags:
@@ -723,6 +737,14 @@ if uploaded is not None:
         st.caption("Display and test selection are independent — e.g. you can show both mean\u00B1SD "
                     "and median (IQR) while still testing with Wilcoxon based on normality.")
 
+        yates_correction = st.checkbox(
+            "Apply Yates' continuity correction (2\u00D72 chi-square)",
+            value=False,
+            help="Only affects chi-square tests on 2\u00D72 tables (ignored for larger tables and for "
+                 "Fisher's exact test). Off by default — the uncorrected chi-square is generally "
+                 "preferred today; Yates' correction is conservative and can reduce power.",
+        )
+
     with col3:
         alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5,
                                  value=0.05, step=0.01)
@@ -759,14 +781,15 @@ if uploaded is not None:
     if st.button("Generate Table 1", type="primary", disabled=not can_generate):
         header, display_rows, csv_rows, flags = build_table1(
             df, var_meta, group_col, test_mode, alpha, display_mode,
-            pct_mode=pct_mode, pct_digits=pct_digits,
+            pct_mode=pct_mode, pct_digits=pct_digits, yates_correction=yates_correction,
         )
         st.session_state["result"] = (header, display_rows, csv_rows, flags, group_col, alpha,
-                                       display_mode, pct_mode, pct_digits)
+                                       display_mode, pct_mode, pct_digits, yates_correction)
 
     if "result" in st.session_state:
         (header, display_rows, csv_rows, flags, result_group_col, result_alpha,
-         result_display_mode, result_pct_mode, result_pct_digits) = st.session_state["result"]
+         result_display_mode, result_pct_mode, result_pct_digits,
+         result_yates_correction) = st.session_state["result"]
 
         st.markdown("### Table 1. Baseline characteristics")
         st.markdown(render_table_markdown(header, display_rows, result_group_col, result_alpha),
@@ -780,7 +803,10 @@ if uploaded is not None:
             footnotes.append("Percentages for categorical variables are calculated among non-missing "
                               "responses for that variable (missing values excluded from the denominator).")
         if "chi2" in flags:
-            footnotes.append("Chi-square test of independence used for categorical comparisons with adequate expected cell counts.")
+            chi2_note = "Chi-square test of independence used for categorical comparisons with adequate expected cell counts"
+            chi2_note += " (Yates' continuity correction applied to 2\u00D72 tables)." if result_yates_correction \
+                else " (no continuity correction applied)."
+            footnotes.append(chi2_note)
         if "fisher" in flags:
             footnotes.append("Fisher's exact test used in place of chi-square when a 2\u00D72 table had an expected cell count below 5.")
         if "lowE" in flags:
@@ -804,7 +830,8 @@ if uploaded is not None:
 
         with dl_col3:
             docx_bytes = build_docx(header, display_rows, result_group_col, result_alpha, flags,
-                                     result_display_mode, pct_mode=result_pct_mode)
+                                     result_display_mode, pct_mode=result_pct_mode,
+                                     yates_correction=result_yates_correction)
             st.download_button("Download Word", docx_bytes, file_name="table1.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
